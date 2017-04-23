@@ -7,14 +7,16 @@ import com.hypertino.hyperbus.transport.api.TransportManager
 import com.hypertino.service.control.api.{Console, Service}
 import monix.eval.Task
 import monix.execution.Ack.Continue
-import monix.execution.atomic.AtomicInt
+import monix.execution.atomic.{AtomicBoolean, AtomicInt, AtomicLong}
 import monix.execution.{Cancelable, Scheduler}
 
+import scala.annotation.tailrec
 import scala.concurrent.duration._
+import scala.util.control.NonFatal
 import scala.util.{Failure, Random, Success}
 
 @body("perf-test-data")
-case class PerfTestData(i1: Int, i2: Int, s1: String, s2: String, d: Double, seq: Seq[String]) extends Body
+case class PerfTestData(i1: Int, s1: String) extends Body
 
 @request(Method.POST, "hb://com.hypertino.perftest")
 case class PerfPostData(body: PerfTestData) extends Request[PerfTestData]
@@ -24,77 +26,79 @@ class PerfService(console: Console, transportManager: TransportManager, implicit
   private val hyperbus = new Hyperbus(transportManager)
   private val cores: Int = Runtime.getRuntime.availableProcessors
 
-  private var subscription: Option[Cancelable] = None
-  private var client: Option[Cancelable] = None
+  private var subscriptions: List[Cancelable] = List.empty
+  private var client = false
   private val random = new Random(100500)
 
   private val sentCount = AtomicInt(0)
   private val receivedCount = AtomicInt(0)
   private val confirmedCount = AtomicInt(0)
   private val failedCount = AtomicInt(0)
+  private val latency = AtomicLong(0)
+
+  private val testData = PerfTestData(random.nextInt, randomString(20))
 
   private var reporter: Option[Cancelable] = startReporter()
 
-  private val testData = PerfTestData(random.nextInt, random.nextInt, randomString(20), randomString(10), random.nextDouble(), Seq(
-    randomString(20), randomString(10),
-    randomString(20), randomString(10),
-    randomString(20), randomString(10)
-  ))
+  //runServer()
+  //Thread.sleep(1000)
+  //runClient(16)
 
-  def runServer(): Unit = {
+  def runServer(parallelism: Int): Unit = {
     console.writeln("Starting server...")
 
-    subscription = Some {
+    subscriptions = (0 until parallelism).map { _ ⇒
       hyperbus.commands[PerfPostData].subscribe { implicit post ⇒
-        receivedCount.increment()
         post.reply {
+          receivedCount.increment()
           Success {
             val b = post.request.body
             val newData = b.copy(
               b.i1 + 1,
-              b.i2 - 1,
-              b.s1 + "hey",
-              b.s2,
-              b.d + 0.3,
-              b.seq :+ "yey"
+              b.s1
             )
             Ok(newData)
           }
         }
         Continue
       }
-    }
+    }.toList
   }
 
-  def runClient(): Unit = {
+  def runClient(parallelism: Int, batchSize: Int): Unit = {
     console.writeln("Starting client...")
-    @volatile var isCanceled = false
-    val cancelable = new Cancelable {
-      override def cancel(): Unit = {
-        isCanceled = true
-      }
-    }
-    Task.fork {
-      Task.eval {
-        while(!isCanceled) {
+    client = true
+    0 until parallelism map { _ ⇒
+      Task.fork {
+        def loop(): Task[Unit] = {
           implicit val mcx = MessagingContext.empty
-
-          sentCount.increment()
-          hyperbus.ask(PerfPostData(testData)).runOnComplete {
-            case Success(result: Ok[PerfTestData]) ⇒
-              if (result.body.i1 == (testData.i1-1)) {
+          val nextBatch = 0 until batchSize map { _ ⇒
+            sentCount.increment()
+            val d = PerfPostData(testData)
+            val start = System.nanoTime()
+            hyperbus.ask(d).map { case result: Ok[PerfTestData@unchecked] ⇒
+              if (result.body.i1 == (testData.i1 + 1)) {
+                val end =
                 confirmedCount.increment()
               }
               else {
                 failedCount.increment()
               }
-            case Failure(e) ⇒
-              failedCount.increment()
+            } onErrorRecover {
+              case NonFatal(e) ⇒
+                println(e)
+                failedCount.increment()
+            } doOnFinish(_ ⇒ Task.now{
+              latency.add((System.nanoTime() - start) / 1000000000)
+            })
           }
+          val taskNext = Task.gatherUnordered(nextBatch)
+          taskNext.flatMap(_ ⇒ loop())
         }
-      }
-    }.runAsync
-    client = Some(cancelable)
+
+        loop()
+      }.runAsync
+    }
   }
 
   private def randomString(len: Int): String = {
@@ -115,11 +119,23 @@ class PerfService(console: Console, transportManager: TransportManager, implicit
     Task.fork {
       Task.eval {
         console.writeln("Please type: server or client or quit")
-
+        var last = System.nanoTime()
+        var lastConf = 0
+        val lastLatency = 0
         while (!isCanceled) {
-          if (client.isDefined || subscription.isDefined) {
-            console.writeln(s"Sent: ${sentCount.get} received: ${receivedCount.get} confirmed: ${confirmedCount.get} failed: ${failedCount.get}")
-            Thread.sleep(1000)
+          if (client || subscriptions.nonEmpty) try {
+            val conf = confirmedCount.get
+            val latencyNow = latency.get
+            val now = System.nanoTime()
+            val deltaTime = (now - last) / 1000000000.0
+            val rps = if (deltaTime > 0) (conf-lastConf) / deltaTime else 0
+            val ltncy = if (conf > 0) (latencyNow - lastLatency) / conf * 1.0 else 0
+            last = now
+            lastConf = conf
+            console.writeln(s"Sent: ${sentCount.get} received: ${receivedCount.get} confirmed: $conf failed: ${failedCount.get} rps: $rps latency: $ltncy")
+            Thread.sleep(5000)
+          } catch {
+            case NonFatal(e) ⇒ // ignore
           }
         }
       }
@@ -129,8 +145,8 @@ class PerfService(console: Console, transportManager: TransportManager, implicit
 
   override def stopService(controlBreak: Boolean): Unit = {
     console.writeln("Stopping...")
-    subscription.foreach(_.cancel())
-    client.foreach(_.cancel())
+    subscriptions.foreach(_.cancel())
+    //client.foreach(_.cancel())
     reporter.foreach(_.cancel())
     hyperbus.shutdown(10.seconds)
   }

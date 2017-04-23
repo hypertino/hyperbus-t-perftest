@@ -8,7 +8,7 @@ class MyServiceController(implicit injector: Injector)
   private val service = inject[PerfService]
 
   override def customCommand = {
-    case "client" ⇒ service.runClient()
-    case "server" ⇒ service.runServer()
+    case "client" ⇒ service.runClient(16, 1024)
+    case "server" ⇒ service.runServer(1)
   }
 }

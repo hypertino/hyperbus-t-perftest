@@ -1,3 +1,7 @@
+fork := true
+
+connectInput in run := true
+
 crossScalaVersions := Seq("2.12.1", "2.11.8")
 
 scalaVersion in Global := "2.12.1"
