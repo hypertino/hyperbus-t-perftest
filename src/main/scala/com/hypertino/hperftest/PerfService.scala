@@ -38,7 +38,8 @@ class PerfService(console: Console, transportManager: TransportManager, implicit
 
   private val testData = PerfTestData(random.nextInt, randomString(20))
 
-  private var reporter: Option[Cancelable] = startReporter()
+  private val reporter: Option[Cancelable] = startReporter()
+  @volatile private var shutdown = false
 
   //runServer()
   //Thread.sleep(1000)
@@ -73,30 +74,39 @@ class PerfService(console: Console, transportManager: TransportManager, implicit
         def loop(): Task[Unit] = {
           implicit val mcx = MessagingContext.empty
           val nextBatch = 0 until batchSize map { _ ⇒
-            sentCount.increment()
-            val d = PerfPostData(testData)
-            val start = System.nanoTime()
-            hyperbus.ask(d).map { case result: Ok[PerfTestData@unchecked] ⇒
-              if (result.body.i1 == (testData.i1 + 1)) {
-                val end =
-                confirmedCount.increment()
-              }
-              else {
-                failedCount.increment()
-              }
-            } onErrorRecover {
-              case NonFatal(e) ⇒
-                println(e)
-                failedCount.increment()
-            } doOnFinish(_ ⇒ Task.now{
-              latency.add((System.nanoTime() - start) / 1000000000)
-            })
+            if (!shutdown) {
+              sentCount.increment()
+              val d = PerfPostData(testData)
+              val start = System.nanoTime()
+              hyperbus.ask(d).map { case result: Ok[PerfTestData@unchecked] ⇒
+                if (result.body.i1 == (testData.i1 + 1)) {
+                  val end =
+                    confirmedCount.increment()
+                }
+                else {
+                  failedCount.increment()
+                }
+              } onErrorRecover {
+                case NonFatal(e) ⇒
+                  println(e)
+                  failedCount.increment()
+              } doOnFinish (_ ⇒ Task.now {
+                latency.add((System.nanoTime() - start) / 1000000000)
+              })
+            }
+            else {
+              Task.unit
+            }
           }
           val taskNext = Task.gatherUnordered(nextBatch)
           taskNext.flatMap(_ ⇒ loop())
         }
 
-        loop()
+        if (shutdown) {
+          Task.unit
+        } else {
+          loop()
+        }
       }.runAsync
     }
   }
@@ -110,10 +120,9 @@ class PerfService(console: Console, transportManager: TransportManager, implicit
   }
 
   def startReporter(): Option[Cancelable] = {
-    @volatile var isCanceled = false
     val cancelable = new Cancelable {
       override def cancel(): Unit = {
-        isCanceled = true
+        shutdown = true
       }
     }
     Task.fork {
@@ -122,7 +131,7 @@ class PerfService(console: Console, transportManager: TransportManager, implicit
         var last = System.nanoTime()
         var lastConf = 0
         val lastLatency = 0
-        while (!isCanceled) {
+        while (!shutdown) {
           if (client || subscriptions.nonEmpty) try {
             val conf = confirmedCount.get
             val latencyNow = latency.get
@@ -147,7 +156,7 @@ class PerfService(console: Console, transportManager: TransportManager, implicit
     console.writeln("Stopping...")
     subscriptions.foreach(_.cancel())
     //client.foreach(_.cancel())
+    hyperbus.shutdown(30.seconds).runAsync
     reporter.foreach(_.cancel())
-    hyperbus.shutdown(10.seconds)
   }
 }
